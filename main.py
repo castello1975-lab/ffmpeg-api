@@ -17,8 +17,9 @@ BACKGROUND_VIDEOS = [
     "https://videos.pexels.com/video-files/3255384/3255384-sd_640_360_25fps.mp4"
 ]
 
+SEGMENT_DURATION = 30  # seconds per background
+
 def generate_ass_subtitles(segments):
-    """Generate ASS subtitle file with karaoke-style highlighting"""
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1280
@@ -36,15 +37,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         start = seg['start']
         end = seg['end']
         text = seg['text'].strip()
-        
+
         def fmt_time(t):
             h = int(t // 3600)
             m = int((t % 3600) // 60)
             s = t % 60
             return f"{h}:{m:02d}:{s:05.2f}"
-        
+
         events += f"Dialogue: 0,{fmt_time(start)},{fmt_time(end)},Default,,0,0,0,,{text}\n"
-    
+
     return header + events
 
 @app.post("/transcribe")
@@ -52,7 +53,6 @@ async def transcribe(audio: UploadFile = File(...)):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
         tmp.write(await audio.read())
         tmp_path = tmp.name
-    
     try:
         result = model.transcribe(tmp_path, word_timestamps=True)
         return {"segments": result["segments"], "text": result["text"]}
@@ -67,54 +67,98 @@ async def render(audio: UploadFile = File(...), title: str = Form("")):
         audio_path = os.path.join(work_dir, "audio.mp3")
         with open(audio_path, "wb") as f:
             f.write(await audio.read())
-        
-        # Transcribe
+
+        # Transcribe for subtitles
         result = model.transcribe(audio_path, word_timestamps=True)
-        
+
         # Generate subtitles
         ass_content = generate_ass_subtitles(result["segments"])
         ass_path = os.path.join(work_dir, "subs.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
-        
-        # Pick random background
-        bg_url = random.choice(BACKGROUND_VIDEOS)
-        bg_path = os.path.join(work_dir, "bg.mp4")
-        
-        # Download background
-        subprocess.run([
-            "ffmpeg", "-y", "-i", bg_url,
-            "-t", "9999", "-c", "copy", bg_path
-        ], check=True, capture_output=True)
-        
+
         # Get audio duration
         probe = subprocess.run([
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_format", audio_path
         ], capture_output=True, text=True)
         duration = float(json.loads(probe.stdout)["format"]["duration"])
-        
-        # Render final video with FFmpeg
+
+        # Build segments list: each segment uses a random background
+        import math
+        num_segments = max(1, math.ceil(duration / SEGMENT_DURATION))
+        segments = []
+        for i in range(num_segments):
+            seg_start = i * SEGMENT_DURATION
+            seg_end = min((i + 1) * SEGMENT_DURATION, duration)
+            seg_duration = seg_end - seg_start
+            bg_url = random.choice(BACKGROUND_VIDEOS)
+            segments.append((bg_url, seg_duration))
+
+        # Download and prepare each background segment
+        segment_files = []
+        for idx, (bg_url, seg_dur) in enumerate(segments):
+            bg_raw = os.path.join(work_dir, f"bg_raw_{idx}.mp4")
+            bg_seg = os.path.join(work_dir, f"bg_seg_{idx}.mp4")
+
+            # Download background
+            subprocess.run([
+                "ffmpeg", "-y", "-i", bg_url,
+                "-t", str(seg_dur + 5),  # download a bit extra
+                "-c", "copy", bg_raw
+            ], check=True, capture_output=True)
+
+            # Loop and trim to exact duration, scale to 1280x720
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-stream_loop", "-1", "-i", bg_raw,
+                "-t", str(seg_dur),
+                "-vf", "scale=1280:720,setsar=1",
+                "-an",
+                "-c:v", "libx264", "-preset", "fast",
+                bg_seg
+            ], check=True, capture_output=True)
+
+            segment_files.append(bg_seg)
+
+        # Concatenate all background segments
+        concat_list = os.path.join(work_dir, "concat.txt")
+        with open(concat_list, "w") as f:
+            for sf in segment_files:
+                f.write(f"file '{sf}'\n")
+
+        bg_combined = os.path.join(work_dir, "bg_combined.mp4")
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list,
+            "-c", "copy",
+            bg_combined
+        ], check=True, capture_output=True)
+
+        # Final render: combined background + audio + subtitles
         output_path = os.path.join(work_dir, "output.mp4")
         subprocess.run([
             "ffmpeg", "-y",
-            "-stream_loop", "-1", "-i", bg_path,
+            "-i", bg_combined,
             "-i", audio_path,
             "-t", str(duration),
-            "-vf", f"scale=1280:720,ass={ass_path}",
+            "-vf", f"ass={ass_path}",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-shortest",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
             output_path
         ], check=True, capture_output=True)
-        
+
         return FileResponse(output_path, media_type="video/mp4", filename="video.mp4")
-    
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()[-2000:]}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Cleanup handled after response
-        pass
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
