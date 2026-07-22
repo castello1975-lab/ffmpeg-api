@@ -5,7 +5,6 @@ import tempfile
 import os
 import json
 import random
-import shutil
 import math
 import whisper
 
@@ -92,19 +91,11 @@ async def render(audio: UploadFile = File(...), title: str = Form("")):
 
         segment_files = []
         for idx, (bg_url, seg_dur) in enumerate(segments):
-            bg_raw = os.path.join(work_dir, f"bg_raw_{idx}.mp4")
             bg_seg = os.path.join(work_dir, f"bg_seg_{idx}.mp4")
 
             subprocess.run([
                 "ffmpeg", "-y",
                 "-stream_loop", "-1", "-i", bg_url,
-                "-t", str(seg_dur + 5),
-                "-c", "copy", bg_raw
-            ], check=True, capture_output=True)
-
-            subprocess.run([
-                "ffmpeg", "-y",
-                "-stream_loop", "-1", "-i", bg_raw,
                 "-t", str(seg_dur),
                 "-vf", "scale=1280:720,setsar=1",
                 "-an",
@@ -152,4 +143,3 @@ async def render(audio: UploadFile = File(...), title: str = Form("")):
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
