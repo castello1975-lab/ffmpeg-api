@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir \
     fastapi \
     uvicorn \
     python-multipart \
-    openai-whisper
+    openai-whisper \
+    requests
 
 WORKDIR /app
 COPY main.py .
