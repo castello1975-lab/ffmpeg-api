@@ -31,6 +31,8 @@ STATIC_FALLBACK_VIDEOS = [
 ]
 
 SEGMENT_DURATION = 45  # seconds of background video per cut
+# Shorts need faster cuts to hold attention; ~60s Short -> ~8 clips.
+SHORTS_SEGMENT_DURATION = 7
 # Default cap on distinct clips per video, to bound render time/API calls.
 # Long-form requests can raise it with the `max_segments` form field, up to
 # HARD_MAX_SEGMENTS (40 clips x 45s covers a 30-minute video).
@@ -60,7 +62,7 @@ def _title_to_query(title: str) -> str:
     return " ".join(keywords[:4]) if keywords else ""
 
 
-def _pexels_search(query, per_page=15):
+def _pexels_search(query, per_page=15, orientation="landscape"):
     """Raw Pexels video search for one query. Returns [] on any failure or
     if PEXELS_API_KEY is not set."""
     if not PEXELS_API_KEY:
@@ -70,7 +72,7 @@ def _pexels_search(query, per_page=15):
         resp = requests.get(
             "https://api.pexels.com/videos/search",
             headers=headers,
-            params={"query": query, "orientation": "landscape", "size": "medium", "per_page": per_page},
+            params={"query": query, "orientation": orientation, "size": "medium", "per_page": per_page},
             timeout=10,
         )
         resp.raise_for_status()
@@ -79,19 +81,23 @@ def _pexels_search(query, per_page=15):
         return []
 
 
-def _videos_to_links(videos):
-    """Pick one reasonably-HD landscape file URL per Pexels video result."""
+def _videos_to_links(videos, vertical=False):
+    """Pick one reasonably-HD file URL per Pexels video result. For vertical
+    (Shorts) output, match on height instead of width."""
     links = []
+    dim = "height" if vertical else "width"
+    target = 1920 if vertical else 1280
+    low, high = (1280, 2560) if vertical else (960, 1920)
     for video in videos:
-        files = [f for f in video.get("video_files", []) if f.get("width")]
-        files.sort(key=lambda f: abs(f["width"] - 1280))
-        hd_candidates = [f["link"] for f in files if 960 <= f["width"] <= 1920]
+        files = [f for f in video.get("video_files", []) if f.get(dim)]
+        files.sort(key=lambda f: abs(f[dim] - target))
+        hd_candidates = [f["link"] for f in files if low <= f[dim] <= high]
         if hd_candidates:
             links.append(hd_candidates[0])
     return links
 
 
-def fetch_pexels_video_urls(count, title="", custom_queries=None):
+def fetch_pexels_video_urls(count, title="", custom_queries=None, vertical=False):
     """Legacy random picker: fetch up to `count` distinct landscape video
     URLs from Pexels, mixing the video's own title with either the caller's
     `custom_queries` or the generic finance/business queries, in random
@@ -111,9 +117,9 @@ def fetch_pexels_video_urls(count, title="", custom_queries=None):
     for q in queries:
         if len(urls) >= count:
             break
-        videos = _pexels_search(q)
+        videos = _pexels_search(q, orientation="portrait" if vertical else "landscape")
         random.shuffle(videos)
-        for link in _videos_to_links(videos):
+        for link in _videos_to_links(videos, vertical=vertical):
             if link in seen:
                 continue
             seen.add(link)
@@ -125,10 +131,10 @@ def fetch_pexels_video_urls(count, title="", custom_queries=None):
     return urls[:count]
 
 
-def build_background_list(num_segments, title="", custom_queries=None):
+def build_background_list(num_segments, title="", custom_queries=None, vertical=False):
     """Return exactly `num_segments` background video URLs, avoiding the same
     clip appearing twice in a row when possible. Random order (legacy path)."""
-    urls = fetch_pexels_video_urls(num_segments, title=title, custom_queries=custom_queries)
+    urls = fetch_pexels_video_urls(num_segments, title=title, custom_queries=custom_queries, vertical=vertical)
 
     pool = urls if urls else list(STATIC_FALLBACK_VIDEOS)
     while len(urls) < num_segments:
@@ -140,10 +146,13 @@ def build_background_list(num_segments, title="", custom_queries=None):
     return urls[:num_segments]
 
 
-def fetch_beat_pool(query):
+def fetch_beat_pool(query, vertical=False):
     """A small pool of distinct clips for one narrative beat, so consecutive
     segments on the same beat don't all show the identical clip."""
-    links = _videos_to_links(_pexels_search(query, per_page=12))
+    links = _videos_to_links(
+        _pexels_search(query, per_page=12, orientation="portrait" if vertical else "landscape"),
+        vertical=vertical,
+    )
     seen, pool = set(), []
     for link in links:
         if link in seen:
@@ -155,7 +164,7 @@ def fetch_beat_pool(query):
     return pool
 
 
-def build_ordered_background_list(num_segments, beats):
+def build_ordered_background_list(num_segments, beats, vertical=False):
     """Map background clips to `beats` -- an ordered list of short search
     phrases describing the story chronologically (e.g. ["empty office
     exterior", "financial documents on desk", "police car lights night",
@@ -174,7 +183,7 @@ def build_ordered_background_list(num_segments, beats):
     for i in range(num_segments):
         beat_idx = min(int(i * len(beats) / num_segments), len(beats) - 1)
         if beat_idx not in pools:
-            pools[beat_idx] = fetch_beat_pool(beats[beat_idx])
+            pools[beat_idx] = fetch_beat_pool(beats[beat_idx], vertical=vertical)
         pool = pools[beat_idx]
         if not pool:
             continue
@@ -204,20 +213,25 @@ def _fmt_time(t):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def generate_ass_subtitles(segments):
+def generate_ass_subtitles(segments, vertical=False):
     """Generate an ASS subtitle file with word-by-word karaoke-style
     highlighting: short punchy caption chunks (a few words each) where the
     current word lights up as it's spoken, in the style most short/long-form
     narration channels use for retention. Falls back to plain per-segment
     lines if word timestamps aren't available."""
-    header = """[Script Info]
+    if vertical:
+        # Shorts: 1080x1920, bigger captions sitting in the lower-middle third.
+        play_x, play_y, font_size, outline, margin_v = 1080, 1920, 86, 8, 560
+    else:
+        play_x, play_y, font_size, outline, margin_v = 1280, 720, 52, 6, 80
+    header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1280
-PlayResY: 720
+PlayResX: {play_x}
+PlayResY: {play_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,52,&H0000D7FF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,3,6,0,2,20,20,80,1
+Style: Default,Arial,{font_size},&H0000D7FF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,3,{outline},0,2,40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -286,7 +300,12 @@ async def render(
     queries: str = Form(""),
     max_segments: int = Form(0),
     music_url: str = Form(""),
+    vertical: bool = Form(False),
 ):
+    """`vertical=true` renders a 1080x1920 Short (portrait footage, short
+    cuts, larger captions) instead of the default 1280x720 long-form video."""
+    out_w, out_h = (1080, 1920) if vertical else (1280, 720)
+    seg_len = SHORTS_SEGMENT_DURATION if vertical else SEGMENT_DURATION
     work_dir = tempfile.mkdtemp()
     try:
         # Save audio
@@ -298,7 +317,7 @@ async def render(
         result = model.transcribe(audio_path, word_timestamps=True)
 
         # Generate subtitles
-        ass_content = generate_ass_subtitles(result["segments"])
+        ass_content = generate_ass_subtitles(result["segments"], vertical=vertical)
         ass_path = os.path.join(work_dir, "subs.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
@@ -315,9 +334,9 @@ async def render(
         # the whole runtime.
         segment_cap = max_segments if max_segments > 0 else MAX_SEGMENTS
         segment_cap = min(segment_cap, HARD_MAX_SEGMENTS)
-        num_segments = max(1, min(segment_cap, math.ceil(duration / SEGMENT_DURATION)))
-        segment_durations = [SEGMENT_DURATION] * (num_segments - 1)
-        segment_durations.append(round(duration - SEGMENT_DURATION * (num_segments - 1), 2))
+        num_segments = max(1, min(segment_cap, math.ceil(duration / seg_len)))
+        segment_durations = [seg_len] * (num_segments - 1)
+        segment_durations.append(round(duration - seg_len * (num_segments - 1), 2))
         segment_durations[-1] = max(segment_durations[-1], 1.0)
 
         # `queries`, if given as an ORDERED comma-separated list of short
@@ -326,9 +345,11 @@ async def render(
         # empty or just one generic category, fall back to the old random
         # picker (title + a shuffled query pool) -- order doesn't matter then.
         beats = [q.strip() for q in queries.split(",") if q.strip()]
-        background_urls = build_ordered_background_list(num_segments, beats)
+        background_urls = build_ordered_background_list(num_segments, beats, vertical=vertical)
         if background_urls is None:
-            background_urls = build_background_list(num_segments, title=title, custom_queries=beats)
+            background_urls = build_background_list(
+                num_segments, title=title, custom_queries=beats, vertical=vertical
+            )
 
         # Download each background clip (looping isn't needed at download
         # time; ffmpeg loops the file at render time if it's shorter than
@@ -389,8 +410,8 @@ async def render(
         concat_labels = ""
         for i, seg_dur in enumerate(segment_durations):
             filter_parts.append(
-                f"[{i}:v]scale=1280:720:force_original_aspect_ratio=increase,"
-                f"crop=1280:720,fps=30,setsar=1,trim=duration={seg_dur:.2f},"
+                f"[{i}:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{out_h},fps=30,setsar=1,trim=duration={seg_dur:.2f},"
                 f"setpts=PTS-STARTPTS[v{i}]"
             )
             concat_labels += f"[v{i}]"
